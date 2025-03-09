@@ -2,10 +2,11 @@ import direction_utils
 import generation_utils
 from neural_controllers import NeuralController
 
-def add_block_hook(
+def _block_hook(
     module, 
     input, 
     output, 
+    steer_func,
     control_vec, 
     control_coef, 
     layer_idx,
@@ -33,8 +34,8 @@ def add_block_hook(
         projections[layer_idx] = []
     projections[layer_idx].append((new_output[:, rep_token, :] @ control_vec.mT).to('cpu'))
     
-    # TODO: Verify why they add the control vector to all inputs and not just last token
-    new_output = new_output + control_coef * control_vec
+    # Steer activation/hidden_state
+    new_output = steer_func(new_output, control_vec, control_coef)
 
     # Save rep_token token activations after steering
     if layer_idx not in activations:
@@ -45,6 +46,27 @@ def add_block_hook(
         new_output = (new_output,) + output[1:] 
         
     return new_output
+
+def add(hidden_state, control_vec, control_coef):
+    return hidden_state + control_vec * control_coef
+
+def proj(hidden_state, control_vec, control_coef):
+    # TODO: Change probed layer, otherwise norm grows with depth due to residual stream
+    norm = torch.linalg.norm(hidden_state, axis=-1, keepdim=True)
+    proj = hidden_state @ control_vec.mT
+    proj = torch.where(proj > norm, 0, norm - proj)
+    hidden_state = hidden_state + control_coef * control_vec * proj
+    norm2 = torch.linalg.norm(hidden_state, axis=-1, keepdim=True)
+    return hidden_state / norm2 * norm
+
+def cos(hidden_state, control_vec, control_coef):
+    # TODO: Change probed layer, otherwise norm grows with depth due to residual stream
+    norm = torch.linalg.norm(hidden_state, axis=-1, keepdim=True)
+    G = control_coef * norm
+    X = hidden_state
+    v = control_vec
+    c = G - X @ v.mT
+    return X + c * v
 
 class Activation(NeuralController):
     def __init__(self, *args, **kwargs):
@@ -59,11 +81,11 @@ class Activation(NeuralController):
             self.hyperparams['forward_batch_size']
         )
 
-    def generate(self, prompt, layers_to_control=[], control_coef=0, block_hook=add_block_hook, **kwargs):
-        return self._controlled_generate(prompt, layers_to_control, control_coef, block_hook, **kwargs)
+    def generate(self, prompt, layers_to_control=[], control_coef=0, steer_func=add, **kwargs):
+        return self._controlled_generate(prompt, layers_to_control, control_coef, steer_func, **kwargs)
         
-    def _controlled_generate(self, prompt, layers_to_control, control_coef, block_hook, **kwargs):
-        self.block_hook = block_hook
+    def _controlled_generate(self, prompt, layers_to_control, control_coef, steer_func, **kwargs):
+        self.steer_func = steer_func
         self._activations = {}
         self.activations = {}
         self.projections = {}
@@ -85,13 +107,15 @@ class Activation(NeuralController):
             control_vec = directions[layer_idx][component_idx]
             if len(control_vec.shape)==1:
                 control_vec = control_vec.reshape(1,1,-1)
+            _control_coef = control_coef if layer_idx in layers_to_control else 0
 
             def block_hook(
                 module, input, 
-                output, control_vec=control_vec, control_coef=control_coef, layer_idx=layer_idx
+                output, control_vec=control_vec, control_coef=_control_coef, layer_idx=layer_idx
             ):
-                return self.block_hook(
-                    module, input, output, 
+                return _block_hook(
+                    module, input, output,
+                    steer_func=self.steer_func,
                     control_vec=control_vec, control_coef=control_coef, layer_idx=layer_idx,
                     _activations=self._activations, activations=self.activations, projections=self.projections,
                 )
