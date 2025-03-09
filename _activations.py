@@ -1,52 +1,7 @@
 import direction_utils
 import generation_utils
 from neural_controllers import NeuralController
-
-def _block_hook(
-    module, 
-    input, 
-    output, 
-    steer_func,
-    control_vec, 
-    control_coef, 
-    layer_idx,
-    _activations,
-    activations,
-    projections,
-    rep_token=-1, 
-    **kwargs
-):
-    """
-    note that module, input are unused, but are
-    required by torch.
-    """ 
-
-    new_output = output[0]
-    control_vec = control_vec.to(dtype=new_output.dtype, device=new_output.device)
-
-    # Save rep_token token activations before steering
-    if layer_idx not in _activations:
-        _activations[layer_idx] = []
-    _activations[layer_idx].append(new_output[:, rep_token, :].to('cpu'))
-
-    # Save projection of rep_token activations onto control_vec before steering
-    if layer_idx not in projections:
-        projections[layer_idx] = []
-    projections[layer_idx].append((new_output[:, rep_token, :] @ control_vec.mT).to('cpu'))
     
-    # Steer activation/hidden_state
-    new_output = steer_func(new_output, control_vec, control_coef)
-
-    # Save rep_token token activations after steering
-    if layer_idx not in activations:
-        activations[layer_idx] = []
-    activations[layer_idx].append(new_output[:, rep_token, :].to('cpu'))
-    
-    if isinstance(output, tuple):
-        new_output = (new_output,) + output[1:] 
-        
-    return new_output
-
 def add(hidden_state, control_vec, control_coef):
     return hidden_state + control_vec * control_coef
 
@@ -88,6 +43,7 @@ class Activation(NeuralController):
         self.steer_func = steer_func
         self._activations = {}
         self.activations = {}
+        self._projections = {}
         self.projections = {}
         
         parent_hook_model = generation_utils.hook_model
@@ -97,6 +53,7 @@ class Activation(NeuralController):
         
         self._activations = {k: self._activations[k] for k in self.hidden_layers}
         self.activations = {k: self.activations[k] for k in self.hidden_layers}
+        self._projections = {k: self._projections[k] for k in self.hidden_layers}
         self.projections = {k: self.projections[k] for k in self.hidden_layers}
         
         return out
@@ -110,15 +67,44 @@ class Activation(NeuralController):
             _control_coef = control_coef if layer_idx in layers_to_control else 0
 
             def block_hook(
-                module, input, 
-                output, control_vec=control_vec, control_coef=_control_coef, layer_idx=layer_idx
+                module, input, output, 
+                control_vec=control_vec, control_coef=_control_coef, layer_idx=layer_idx, rep_token=-1
             ):
-                return _block_hook(
-                    module, input, output,
-                    steer_func=self.steer_func,
-                    control_vec=control_vec, control_coef=control_coef, layer_idx=layer_idx,
-                    _activations=self._activations, activations=self.activations, projections=self.projections,
-                )
+                """
+                note that module, input are unused, but are
+                required by torch.
+                """ 
+            
+                new_output = output[0]
+                control_vec = control_vec.to(dtype=new_output.dtype, device=new_output.device)
+            
+                # Save rep_token token activations before steering
+                if layer_idx not in self._activations:
+                    self._activations[layer_idx] = []
+                self._activations[layer_idx].append(new_output[:, rep_token, :].to('cpu'))
+            
+                # Save projection of rep_token activations onto control_vec before steering
+                if layer_idx not in self._projections:
+                    self._projections[layer_idx] = []
+                self._projections[layer_idx].append((new_output[:, rep_token, :] @ control_vec.mT).to('cpu'))
+                
+                # Steer activation/hidden_state
+                new_output = steer_func(new_output, control_vec, control_coef)
+            
+                # Save rep_token token activations after steering
+                if layer_idx not in self.activations:
+                    self.activations[layer_idx] = []
+                self.activations[layer_idx].append(new_output[:, rep_token, :].to('cpu'))
+
+                # Save projection of rep_token activations onto control_vec after steering
+                if layer_idx not in self.projections:
+                    self.projections[layer_idx] = []
+                self.projections[layer_idx].append((new_output[:, rep_token, :] @ control_vec.mT).to('cpu'))
+                
+                if isinstance(output, tuple):
+                    new_output = (new_output,) + output[1:] 
+                    
+                return new_output
                       
             block = model.model.layers[layer_idx]
             hook_handle = block.register_forward_hook(block_hook)
